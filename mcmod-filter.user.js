@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MC 百科内容屏蔽
 // @namespace    https://www.mcmod.cn/
-// @version      0.4.0
+// @version      0.4.1
 // @description  屏蔽 MC 百科的模组、整合包、作者、评论用户和评论正文。
 // @homepageURL  https://github.com/MX703DR/mcmod-filter
 // @supportURL   https://github.com/MX703DR/mcmod-filter/issues
@@ -423,7 +423,7 @@
             panel.tabIndex = -1;
             const heading = make('header', '', { className: 'mcf-header' });
             heading.append(make('h2', '🛡 ' + title, { id: 'mcf-panel-title' }),
-                make('small', 'v0.4.0 · ' + api.pageType()), control('✕', closePanel, 'mcf-icon'));
+                make('small', 'v0.4.1 · ' + api.pageType()), control('✕', closePanel, 'mcf-icon'));
             heading.lastChild.setAttribute('aria-label', '关闭设置面板');
             tabs = make('nav', '', { className: 'mcf-tabs' });
             tabs.setAttribute('aria-label', '设置分类');
@@ -894,6 +894,8 @@
     const cardSelectors = [
         '.modlist-block', '.result-item', '.author-mods .block', '.author-partner .block',
         '.class-relation-list li.relation > ul > li',
+        '.class_category_block .left .list :is(.block,.card)',
+        '.class_category_block :is(.left,.right) .list > li',
     ];
     if (home) {
         cardSelectors.push(
@@ -903,8 +905,11 @@
         );
     }
     const cardSelector = cardSelectors.join(',');
-    const entryLinkSelector = 'a[href*="/class/"], a[href*="/modpack/"], a[href*="/author/"]';
-    const homepageWrapperSelector = 'li,article,.card,.block,.item';
+    const entryLinkSelector = 'a[href*="class/"], a[href*="modpack/"], a[href*="author/"]';
+    const entryWrapperSelector = 'li,article,tr,[role="listitem"],.card,.block,.item,.list-block';
+    const excludedEntryArea = 'header,footer,nav,[role="navigation"],.breadcrumb,.common-header,' +
+        '.common-comment-block,.common-text,.postContent,[data-mcf-ui]';
+    const entryWalkBoundary = 'body,main,nav,header,footer,[role="main"],[role="navigation"]';
     const detail = entry(location.href);
     const observed = new Map();
     const visible = new WeakSet();
@@ -1240,38 +1245,60 @@
         return { ...item, names, label };
     }
 
-    function homepageCard(link) {
+    function itemLinks(node) {
+        return [...node.querySelectorAll(entryLinkSelector)].map(link => entry(link.href)).filter(Boolean);
+    }
+
+    function hasPeerCard(node, item) {
+        return [node.previousElementSibling, node.nextElementSibling].some(peer => {
+            if (!peer || peer.tagName !== node.tagName) return false;
+            if (node.classList.length && ![...node.classList].some(name => peer.classList.contains(name))) return false;
+            const entries = itemLinks(peer);
+            return entries.length > 0 && entries[0].type === item.type && entries[0].url !== item.url &&
+                entries.every(other => other.url === entries[0].url);
+        });
+    }
+
+    function entryCard(link) {
         const item = entry(link.href);
         if (!item) return null;
         const known = link.closest(cardSelector);
         if (known && readCard(known)?.url === item.url) return known;
-        const wrapper = link.closest(homepageWrapperSelector);
-        if (wrapper && [...wrapper.querySelectorAll(entryLinkSelector)].every(anchor => {
-            const linked = entry(anchor.href);
-            return !linked || linked.url === item.url;
-        })) return wrapper;
+        if (link.closest(excludedEntryArea) || known?.matches('.result-item,.modlist-block')) return null;
+        // Some older index layouts have anonymous ranked rows and tiles rather than the modern card classes.
+        let parent = link.parentElement;
+        for (let depth = 0; parent && depth < 5 && !parent.matches(entryWalkBoundary);
+            depth++, parent = parent.parentElement) {
+            if (parent.closest(excludedEntryArea)) break;
+            if (itemLinks(parent).some(other => other.url !== item.url)) break;
+            if (parent.matches(entryWrapperSelector) || hasPeerCard(parent, item)) return parent;
+        }
         return link;
     }
 
-    function homepageContext(target) {
+    function cardAt(target) {
         const link = target.closest(entryLinkSelector);
         if (link) {
-            const card = homepageCard(link);
+            const card = entryCard(link);
             if (card) return card;
         }
-        const wrapper = target.closest(homepageWrapperSelector);
-        const firstEntry = wrapper && [...wrapper.querySelectorAll(entryLinkSelector)]
-            .find(anchor => entry(anchor.href));
-        return firstEntry && homepageCard(firstEntry) === wrapper ? wrapper : null;
+        const known = target.closest(cardSelector);
+        if (known) return known;
+        if (target.closest(excludedEntryArea)) return null;
+        for (let wrapper = target, depth = 0;
+            wrapper && depth < 5 && !wrapper.matches(entryWalkBoundary);
+            wrapper = wrapper.parentElement, depth++) {
+            const first = [...wrapper.querySelectorAll(entryLinkSelector)].find(anchor => entry(anchor.href));
+            if (first && entryCard(first) === wrapper) return wrapper;
+        }
+        return null;
     }
 
     function pageCards() {
         const cards = new Set(document.querySelectorAll(cardSelector));
-        if (home) {
-            for (const link of document.querySelectorAll(entryLinkSelector)) {
-                const card = homepageCard(link);
-                if (card) cards.add(card);
-            }
+        for (const link of document.querySelectorAll(entryLinkSelector)) {
+            const card = entryCard(link);
+            if (card) cards.add(card);
         }
         return cards;
     }
@@ -1435,7 +1462,7 @@
             const info = projectAuthor(authorRow);
             return { ...info, type: 'author', label: info.names[0] || info.id, target: authorRow };
         }
-        const card = (home && homepageContext(target)) || target.closest(cardSelector);
+        const card = cardAt(target);
         const info = card ? readCard(card) : null;
         if (info) return { ...info, target: card, card: true };
         const summary = target.closest('.class-title,.author-user-frame');
@@ -1621,6 +1648,8 @@
         if (detail) return categories[detail.type] + '详情';
         if (home) return '首页';
         if (location.hostname === 'search.mcmod.cn') return '搜索';
+        if (location.pathname.startsWith('/class/category/')) return '模组分类';
+        if (location.pathname.startsWith('/modpack/category/')) return '整合包分类';
         if (location.pathname === '/modlist.html') return '模组检索';
         if (location.pathname === '/modpack.html') return '整合包检索';
         return '主站';
