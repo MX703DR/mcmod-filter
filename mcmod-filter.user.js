@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MC 百科内容屏蔽
 // @namespace    https://www.mcmod.cn/
-// @version      0.4.1
+// @version      0.4.2
 // @description  屏蔽 MC 百科的模组、整合包、作者、评论用户和评论正文。
 // @homepageURL  https://github.com/MX703DR/mcmod-filter
 // @supportURL   https://github.com/MX703DR/mcmod-filter/issues
@@ -423,7 +423,7 @@
             panel.tabIndex = -1;
             const heading = make('header', '', { className: 'mcf-header' });
             heading.append(make('h2', '🛡 ' + title, { id: 'mcf-panel-title' }),
-                make('small', 'v0.4.1 · ' + api.pageType()), control('✕', closePanel, 'mcf-icon'));
+                make('small', 'v0.4.2 · ' + api.pageType()), control('✕', closePanel, 'mcf-icon'));
             heading.lastChild.setAttribute('aria-label', '关闭设置面板');
             tabs = make('nav', '', { className: 'mcf-tabs' });
             tabs.setAttribute('aria-label', '设置分类');
@@ -460,7 +460,7 @@
             switchRow(makeSection('advanced', '精确过滤'), 'resolveAuthors', '按需读取卡片所对应条目页的作者信息');
             const comment = makeSection('comments', '评论区过滤');
             switchRow(comment, 'commentEnabled', '启用评论区过滤');
-            comment.append(make('p', '命中黑名单的评论直接隐藏。要查看命中内容和原因，可在「基础」中开启审查模式。',
+            comment.append(make('p', '主评论命中时隐藏整楼。楼中楼命中时，能识别的后续回复也会隐藏。可在「基础」开启审查模式查看原因。',
                 { className: 'mcf-hint' }));
             for (const field of comments) renderField('comments', field);
             for (const base of [...projects, ...comments]) renderField('allow', api.allowField(base), base);
@@ -917,6 +917,7 @@
     const manual = new WeakSet();
     const hits = new Map();
     const seenNodes = new WeakMap();
+    const seenReplies = new WeakMap();
     const authorCache = new Map();
     const authorPending = new Map();
     const countKey = 'mcmod-filter-hits-v1';
@@ -1303,17 +1304,26 @@
         return cards;
     }
 
+    function replyMention(body) {
+        const mention = body?.firstElementChild;
+        const prefix = mention?.previousSibling;
+        const suffix = mention?.nextSibling;
+        const uid = uidFromLink(mention?.getAttribute('href'));
+        if (uid && prefix === body.firstChild && /^(?:回复|回覆|回復|Reply to)\s*$/i.test(prefix?.textContent ?? '') &&
+            /^\s*[:：]/.test(suffix?.textContent ?? '')) {
+            return { uid, prefix, mention, suffix };
+        }
+        return null;
+    }
+
     function plainText(element, isReply = false) {
         if (!element) return '';
         const copy = element.cloneNode(true);
-        const mention = copy.firstElementChild;
-        const prefix = mention?.previousSibling;
-        const suffix = mention?.nextSibling;
-        if (isReply && uidFromLink(mention?.getAttribute('href')) && prefix === copy.firstChild &&
-            /^(?:回复|回覆|Reply to)\s*$/i.test(prefix?.textContent ?? '') && /^[:：]/.test(suffix?.textContent ?? '')) {
-            prefix.remove();
-            mention.remove();
-            suffix.textContent = suffix.textContent.slice(1);
+        const target = isReply ? replyMention(copy) : null;
+        if (target) {
+            target.prefix.remove();
+            target.mention.remove();
+            target.suffix.textContent = target.suffix.textContent.replace(/^\s*[:：]/, '');
         }
         for (const node of copy.querySelectorAll('br, img, p, div, li')) {
             if (node.matches('br, img')) {
@@ -1338,12 +1348,12 @@
         return { uid, name, id, body, reply };
     }
 
-    function commentMatch({ uid, name, body, reply }) {
+    function commentMatch({ uid, name, body, reply, text }) {
         if (idMatch('allowUserUids', uid) || wordMatch('allowUserWords', [name])) return '';
-        const text = settings.words.allowCommentWords.length || settings.words.commentWords.length
-            ? plainText(body, reply) : '';
-        if (wordMatch('allowCommentWords', [text])) return '';
-        return idMatch('userUids', uid) || wordMatch('userWords', [name]) || wordMatch('commentWords', [text]);
+        const content = text ?? ((settings.words.allowCommentWords.length || settings.words.commentWords.length)
+            ? plainText(body, reply) : '');
+        if (wordMatch('allowCommentWords', [content])) return '';
+        return idMatch('userUids', uid) || wordMatch('userWords', [name]) || wordMatch('commentWords', [content]);
     }
 
     function matchActivity(row) {
@@ -1412,16 +1422,64 @@
         target.before(detailNotice);
     }
 
+    function markComment(next, row, comment, reason, inherited = false) {
+        const { name, body, reply, text = plainText(body, reply) } = comment;
+        const info = { ...comment, type: 'comment', label: [name, text].filter(Boolean).join(' · ') };
+        next.set(row, { reason, label: name || '评论', mode: 'hide', info, commentRow: true, inherited });
+    }
+
+    function repliesInOrder(floor) {
+        const current = [...floor.querySelectorAll('.comment-reply-row')].map(row => {
+            const comment = readComment(row);
+            comment.text = plainText(comment.body, true);
+            return { row, comment, id: positiveId(comment.id), targetUid: replyMention(comment.body)?.uid };
+        });
+        if (current.some(item => !item.id)) return current;
+        const seen = seenReplies.get(floor) ?? new Map();
+        seenReplies.set(floor, seen);
+        const byId = new Map(current.map(item => [item.id, item]));
+        for (const { id, targetUid, comment } of current) {
+            const { uid, name, text } = comment;
+            seen.set(id, { id, targetUid, comment: { uid, name, text } });
+        }
+        while (seen.size > 500) seen.delete(seen.keys().next().value);
+        return [...new Map([...seen, ...byId]).values()].sort((a, b) =>
+            a.id.length - b.id.length || a.id.localeCompare(b.id));
+    }
+
+    function markReplyChain(next, floor) {
+        const earlier = new Map();
+        for (const { row, comment, targetUid } of repliesInOrder(floor)) {
+            const parent = earlier.get(targetUid);
+            // The site identifies the replied-to account, so mixed visible/blocked candidates are ambiguous.
+            const inherited = parent && !parent.hasVisible ? parent.reason : '';
+            const reason = inherited || commentMatch(comment);
+            if (row && reason) {
+                markComment(next, row, comment, inherited ? `回复链命中：${reason}` : reason, Boolean(inherited));
+            }
+            if (comment.uid) {
+                const previous = earlier.get(comment.uid);
+                earlier.set(comment.uid, { hasVisible: previous?.hasVisible || !reason, reason });
+            }
+        }
+    }
+
     function markComments(next) {
         if (!settings.hasCommentRules) return;
-        for (const row of document.querySelectorAll('.common-comment-block :is(.comment-row, .comment-reply-row)')) {
+        for (const row of document.querySelectorAll('.common-comment-block .comment-row')) {
             const comment = readComment(row);
             const reason = commentMatch(comment);
-            if (!reason) continue;
-            const { name, reply, body } = comment;
-            const label = name || '评论';
-            const info = { ...comment, type: 'comment', label: [name, plainText(body, reply)].filter(Boolean).join(' · ') };
-            next.set(row, { reason, label, mode: reply ? 'hide' : 'thread-hidden', info, commentRow: true });
+            const floor = commentSlot(row)?.querySelector(':scope > .comment-reply-floor');
+            if (reason) {
+                markComment(next, row, comment, reason);
+                if (settings.raw.reviewMode && floor) {
+                    for (const reply of floor.querySelectorAll('.comment-reply-row')) {
+                        markComment(next, reply, readComment(reply), `主评论命中：${reason}`, true);
+                    }
+                }
+            } else if (floor) {
+                markReplyChain(next, floor);
+            }
         }
     }
 
@@ -1444,7 +1502,7 @@
         banner.dataset.mcfUi = '';
         banner.dataset.reason = hit.reason;
         banner.append(make('span', `命中规则：${hit.reason}`));
-        const pass = passFor(hit.info);
+        const pass = hit.inherited ? null : passFor(hit.info);
         if (pass) banner.append(button('放行', () => ui.allow(pass, hit.label)));
         root.prepend(banner);
     }
@@ -1512,7 +1570,7 @@
         const itemKey = info?.id ? `${comments ? location.pathname : ''}:${info.type}:${info.id}` : seenNodes.get(node);
         const key = `${itemKey}:${hit.reason}`;
         if (hits.has(key)) return false;
-        const pass = passFor(info);
+        const pass = hit.inherited ? null : passFor(info);
         hits.set(key, { ...hit, pass, comment: comments, info: {
             url: info?.url, label: info?.label || hit.label, uid: info?.uid,
         }, release: hit.reason === '手动' ? () => { manual.delete(node); scan(); } : null });
@@ -1662,14 +1720,6 @@
 
     const css = make('style', `
         [data-mcf-filtered="hide"], [data-mcf-filtered="detail"] { display: none !important; }
-        [data-mcf-filtered="thread-hidden"] > .comment-row-userinfo,
-        [data-mcf-filtered="thread-hidden"] > .comment-row-content > :not(.comment-reply-floor) {
-            display: none !important;
-        }
-        [data-mcf-filtered="thread-hidden"]:not(:has(.comment-reply-floor)) { display:none!important; }
-        [data-mcf-filtered="thread-hidden"]:not(:has(.comment-reply-row:not([data-mcf-filtered="hide"]))) {
-            margin:0!important;padding:0!important;border:0!important;
-        }
         .mcf-comment-review > .comment-row-content > .comment-row-text {
             max-height:none!important;overflow:visible!important;
         }
